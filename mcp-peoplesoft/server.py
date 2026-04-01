@@ -1,834 +1,718 @@
 """
-mcp-peoplesoft: MCP Server para integração com PeopleSoft
-Ferramentas de análise de fluxo, metadados e manutenção de código PeopleSoft.
+mcp-peoplesoft — MCP Server para PeopleSoft (Itaú Unibanco)
+============================================================
+Servidor MCP unificado que combina:
+  • Ferramentas de análise PeopleSoft (trace, metadata, PeopleCode, AE)
+  • Ferramentas semânticas de RH, Folha, PeopleTools (rgrz/peoplesoft-mcp)
+  • Ferramentas específicas de Time & Labor — Jornada Mista / Grupo SEMESTRAL
+  • Monitoramento de produção + base de SOPs CAG (peoplesoft_sentry)
+
+Dependências:
+    pip install -r requirements.txt
+
+Variáveis de ambiente (.env):
+    ORACLE_DSN      = host:port/service  (ou PS_DB_DSN)
+    ORACLE_USER     = SYSADM             (ou PS_DB_USER)
+    ORACLE_PASSWORD = ****               (ou PS_DB_PASSWORD)
+    MCP_PROJECT_DIR = /caminho/do/projeto (opcional)
+
+Uso:
+    python server.py
 """
 
 import os
 import re
 import json
 import sqlite3
-import hashlib
 import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+from contextlib import asynccontextmanager
 
-import mcp.server.stdio
-import mcp.types as types
-from mcp.server import Server
+from fastmcp import FastMCP
+from dotenv import load_dotenv
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(os.getenv("MCP_PROJECT_DIR", Path(__file__).parent))
+load_dotenv()
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+BASE_DIR      = Path(os.getenv("MCP_PROJECT_DIR", Path(__file__).parent))
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 TRACES_DIR    = KNOWLEDGE_DIR / "traces"
-VECTORS_DIR   = KNOWLEDGE_DIR / "vectors"
 EXPORTS_DIR   = KNOWLEDGE_DIR / "exports"
 DB_PATH       = KNOWLEDGE_DIR / "knowledge.db"
+DOCS_DIR      = BASE_DIR / "docs"
 
-for d in [KNOWLEDGE_DIR, TRACES_DIR, VECTORS_DIR, EXPORTS_DIR]:
+for d in [KNOWLEDGE_DIR, TRACES_DIR, EXPORTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# ─── Oracle credentials ────────────────────────────────────────────────────────
-PS_DB_USER     = os.getenv("PS_DB_USER", "")
-PS_DB_PASSWORD = os.getenv("PS_DB_PASSWORD", "")
-PS_DB_DSN      = os.getenv("PS_DB_DSN", "")
-
-# ─── Whitelist de tabelas para run_safe_query ──────────────────────────────────
+# ─── Whitelist de segurança para run_safe_query ──────────────────────────────
 ALLOWED_TABLES = {
-    "PSRECDEFN", "PSRECFIELD", "PSDBFIELD",
+    # PeopleTools metadata
+    "PSRECDEFN", "PSRECFIELD", "PSDBFIELD", "PSKEYDEFN", "PSXLATITEM",
     "PSPCMPROG", "PSPCMTXT",
     "PSAEAPPLDEFN", "PSAESECTDEFN", "PSAESTEPDEFN", "PSAEAPPLSTATE",
     "PSPRCSRQST", "PS_PRCS_RQST",
     "PSWORKLIST", "PSACTIVITY", "PSROUTE",
     "PSIBSVCSETUP", "PSNODESMSGCONT", "PSMSGNODEDEFN", "PSIBSUBDEFN",
     "PSPROJITEM", "PSPROJECTDEFN", "PSLOCK",
+    # T&L metadata
+    "PS_TL_RULE_DEFN", "PS_TL_GROUP_RULE", "PS_TL_RULE_STEPS",
+    "PS_TL_STP_SQL_TBL", "PS_TL_EMPL_GROUP",
+    # HR read-only
+    "PS_PERSONAL_DATA", "PS_JOB", "PS_EMPLOYMENT", "PS_DEPT_TBL",
 }
 
-# ─── SQLite / Knowledge DB ─────────────────────────────────────────────────────
+# ─── SQLite / Knowledge DB ───────────────────────────────────────────────────
 
-def get_sqlite_conn() -> sqlite3.Connection:
+def _get_sqlite():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db():
-    conn = get_sqlite_conn()
-    cur = conn.cursor()
-    # Tabela de chunks de trace (FTS5)
-    cur.executescript("""
+def _init_db():
+    conn = _get_sqlite()
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS trace_chunks (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
             trace_file TEXT NOT NULL,
-            section   TEXT,
-            step      TEXT,
-            elapsed   REAL,
-            content   TEXT,
+            section    TEXT,
+            step       TEXT,
+            elapsed    REAL,
+            content    TEXT,
             indexed_at TEXT
         );
-
         CREATE VIRTUAL TABLE IF NOT EXISTS trace_fts
-        USING fts5(trace_file, section, step, content, content=trace_chunks, content_rowid=id);
-
+        USING fts5(trace_file, section, step, content,
+                   content=trace_chunks, content_rowid=id);
         CREATE TABLE IF NOT EXISTS metadata_cache (
-            recname     TEXT PRIMARY KEY,
-            payload     TEXT,
-            cached_at   TEXT
+            recname   TEXT PRIMARY KEY,
+            payload   TEXT,
+            cached_at TEXT
         );
-
         CREATE TABLE IF NOT EXISTS knowledge_notes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic       TEXT,
-            category    TEXT,
-            content     TEXT,
-            created_at  TEXT
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic      TEXT,
+            category   TEXT,
+            content    TEXT,
+            created_at TEXT
         );
     """)
     conn.commit()
     conn.close()
 
-init_db()
 
-# ─── Oracle helper ─────────────────────────────────────────────────────────────
+_init_db()
 
-def get_oracle_conn():
-    try:
-        import oracledb
-        conn = oracledb.connect(
-            user=PS_DB_USER,
-            password=PS_DB_PASSWORD,
-            dsn=PS_DB_DSN,
+# ─── Oracle helper síncrono (para ferramentas de trace/metadata) ─────────────
+
+def _oracle_query(sql: str, params: dict | None = None, max_rows: int = 500) -> list[dict]:
+    """Query síncrona usada nas tools legadas (trace, metadata, references)."""
+    from db import execute_query_sync
+    return execute_query_sync(sql, params, max_rows)
+
+
+# ─── MCP Server ──────────────────────────────────────────────────────────────
+mcp = FastMCP(
+    "mcp-peoplesoft",
+    instructions=(
+        "Servidor MCP para PeopleSoft (Itaú Unibanco). "
+        "Ferramentas de análise de metadados PeopleTools, RH, Folha de Pagamento, "
+        "Time & Labor e diagnóstico de jornadas mistas. "
+        "Use sempre ferramentas de leitura/introspecção antes de propor alterações."
+    ),
+)
+
+# ─── Resources (documentação inline) ────────────────────────────────────────
+
+@mcp.resource("peoplesoft://schema-guide")
+def get_schema_guide() -> str:
+    """Guia de tabelas PeopleSoft por módulo (HR, GP, T&L, Benefits, System)."""
+    p = DOCS_DIR / "peoplesoft_schema_guide.md"
+    return p.read_text(encoding="utf-8") if p.exists() else "Arquivo não encontrado."
+
+
+@mcp.resource("peoplesoft://concepts")
+def get_concepts() -> str:
+    """Conceitos PeopleSoft: effective dating, EMPLID, SetID, translate values."""
+    p = DOCS_DIR / "peoplesoft_concepts.md"
+    return p.read_text(encoding="utf-8") if p.exists() else "Arquivo não encontrado."
+
+
+@mcp.resource("peoplesoft://query-examples")
+def get_query_examples() -> str:
+    """Exemplos de queries SQL PeopleSoft: effective-dated, joins, GP, T&L."""
+    p = DOCS_DIR / "sql_query_examples.md"
+    return p.read_text(encoding="utf-8") if p.exists() else "Arquivo não encontrado."
+
+
+@mcp.resource("peoplesoft://peopletools-guide")
+def get_peopletools_guide() -> str:
+    """Arquitetura PeopleTools: Records, Pages, Components, AE, IB, Security."""
+    p = DOCS_DIR / "peopletools_guide.md"
+    return p.read_text(encoding="utf-8") if p.exists() else "Arquivo não encontrado."
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BLOCO A — FERRAMENTAS DE ANÁLISE (legado mcp-peoplesoft, mantidas e aprimoradas)
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def trace_workflow(
+    trace_file: str,
+    query: str = "",
+    top_slow: int = 10,
+) -> dict:
+    """
+    Analisa arquivos de trace PeopleSoft (.tracesql / .trc).
+
+    Quebra o arquivo em chunks por Section/Step, extrai SQLs e timings
+    (Elapsed Time), indexa no SQLite FTS5 para busca semântica e
+    retorna os N steps mais lentos.
+
+    Coloque o arquivo em knowledge/traces/ antes de chamar esta tool.
+
+    Args:
+        trace_file: Nome do arquivo na pasta knowledge/traces/
+        query:      Termo de busca FTS no conteúdo do trace (opcional)
+        top_slow:   Retorna os N steps mais lentos (padrão: 10)
+
+    Returns:
+        Árvore de execução, steps lentos e resultados de busca FTS.
+    """
+    fpath = TRACES_DIR / trace_file
+    if not fpath.exists():
+        return {"error": f"Arquivo não encontrado: {fpath}. Copie para knowledge/traces/"}
+
+    raw = fpath.read_text(encoding="utf-8", errors="replace")
+
+    # Parse por Section/Step
+    chunks: list[tuple] = []
+    current_section, current_step = "", ""
+    current_lines: list[str] = []
+    elapsed_re = re.compile(r"Elapsed\s+Time\s*[:=]\s*([\d.]+)", re.IGNORECASE)
+
+    for line in raw.splitlines():
+        sec_m = re.match(r"^\s*Section\s*[:\-]?\s*(.+)", line, re.IGNORECASE)
+        stp_m = re.match(r"^\s*Step\s*[:\-]?\s*(.+)",    line, re.IGNORECASE)
+
+        if sec_m:
+            if current_lines:
+                txt = "\n".join(current_lines)
+                elapsed_vals = [float(x) for x in elapsed_re.findall(txt)]
+                chunks.append((current_section, current_step, max(elapsed_vals, default=0.0), txt))
+            current_section, current_step = sec_m.group(1).strip(), ""
+            current_lines = []
+        elif stp_m:
+            if current_lines:
+                txt = "\n".join(current_lines)
+                elapsed_vals = [float(x) for x in elapsed_re.findall(txt)]
+                chunks.append((current_section, current_step, max(elapsed_vals, default=0.0), txt))
+            current_step  = stp_m.group(1).strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        txt = "\n".join(current_lines)
+        elapsed_vals = [float(x) for x in elapsed_re.findall(txt)]
+        chunks.append((current_section, current_step, max(elapsed_vals, default=0.0), txt))
+
+    # Indexar no SQLite
+    conn  = _get_sqlite()
+    now   = datetime.datetime.now().isoformat()
+    conn.execute("DELETE FROM trace_chunks WHERE trace_file = ?", (trace_file,))
+    for sec, stp, elapsed, content in chunks:
+        conn.execute(
+            "INSERT INTO trace_chunks (trace_file, section, step, elapsed, content, indexed_at) VALUES (?,?,?,?,?,?)",
+            (trace_file, sec, stp, elapsed, content, now),
         )
-        return conn
-    except Exception as e:
-        raise ConnectionError(f"Falha ao conectar ao Oracle: {e}")
+    conn.commit()
+
+    # Top slow
+    slow_cur = conn.execute(
+        "SELECT section, step, elapsed FROM trace_chunks WHERE trace_file = ? ORDER BY elapsed DESC LIMIT ?",
+        (trace_file, top_slow),
+    )
+    slow_steps = [dict(r) for r in slow_cur.fetchall()]
+
+    # FTS
+    fts_results: list[dict] = []
+    if query.strip():
+        fts_cur = conn.execute(
+            """
+            SELECT tc.section, tc.step, tc.elapsed, SUBSTR(tc.content, 1, 400) AS snippet
+            FROM trace_fts
+            JOIN trace_chunks tc ON tc.id = trace_fts.rowid
+            WHERE trace_fts MATCH ? AND tc.trace_file = ?
+            LIMIT 20
+            """,
+            (query, trace_file),
+        )
+        fts_results = [dict(r) for r in fts_cur.fetchall()]
+
+    conn.close()
+
+    return {
+        "trace_file":    trace_file,
+        "total_chunks":  len(chunks),
+        "top_slow_steps": slow_steps,
+        "fts_query":     query,
+        "fts_results":   fts_results,
+        "indexed_at":    now,
+    }
 
 
-def oracle_query(sql: str, params: dict | None = None, max_rows: int = 500) -> list[dict]:
-    conn = get_oracle_conn()
+@mcp.tool()
+async def get_table_metadata(recname: str, include_fields: bool = True) -> dict:
+    """
+    Retorna metadados completos de um record PeopleSoft.
+
+    Consulta PSRECDEFN, PSRECFIELD e PSDBFIELD. Cacheia o resultado
+    no SQLite local para respostas mais rápidas em consultas repetidas.
+
+    Args:
+        recname:        Nome do record (ex: 'JOB', 'TL_GROUP_RULE'). PS_ é opcional.
+        include_fields: Se True (padrão), inclui a lista de fields com tipos.
+
+    Returns:
+        Metadados do record + lista de fields (se include_fields=True).
+    """
+    clean = recname.upper().replace("PS_", "")
+
+    # Verificar cache
+    conn = _get_sqlite()
+    row  = conn.execute("SELECT payload FROM metadata_cache WHERE recname = ?", (clean,)).fetchone()
+    conn.close()
+    if row:
+        return json.loads(row["payload"])
+
     try:
-        cur = conn.cursor()
-        cur.execute(sql, params or {})
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchmany(max_rows)
-        return [dict(zip(cols, row)) for row in rows]
-    finally:
-        conn.close()
+        rec_rows = _oracle_query(
+            "SELECT RECNAME, RECDESCR, RECTYPE, FIELDCOUNT FROM PSRECDEFN WHERE RECNAME = :recname",
+            {"recname": clean},
+        )
+    except Exception as e:
+        return {"error": str(e)}
 
-# ─── Embedding (lazy load) ─────────────────────────────────────────────────────
-_embed_model = None
+    if not rec_rows:
+        return {"error": f"Record '{recname}' não encontrado."}
 
-def get_embed_model():
-    global _embed_model
-    if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embed_model
+    result: dict[str, Any] = {
+        "record_name": clean,
+        "table_name":  f"PS_{clean}",
+        **rec_rows[0],
+    }
 
-# ─── Dependency graph ──────────────────────────────────────────────────────────
-import networkx as nx
-dep_graph = nx.DiGraph()
-
-# ─── MCP Server ───────────────────────────────────────────────────────────────
-server = Server("mcp-peoplesoft")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL 1 — trace_workflow
-# ══════════════════════════════════════════════════════════════════════════════
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="trace_workflow",
-            description=(
-                "Faz parse de arquivos .tracesql/.trc do PeopleSoft. "
-                "Quebra em chunks por Section/Step, extrai SQLs e timings (Elapsed Time). "
-                "Indexa no SQLite FTS5 para busca de texto e retorna os N steps mais lentos."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "trace_file": {"type": "string", "description": "Nome do arquivo em knowledge/traces/"},
-                    "query":      {"type": "string", "description": "Busca FTS no conteúdo do trace"},
-                    "top_slow":   {"type": "integer", "description": "Retorna N steps mais lentos", "default": 10},
-                },
-                "required": ["trace_file"],
-            },
-        ),
-        types.Tool(
-            name="get_table_metadata",
-            description=(
-                "Consulta PSRECDEFN, PSRECFIELD e PSDBFIELD para retornar metadados "
-                "completos de um record PeopleSoft. Cacheia resultado no SQLite local."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "recname":        {"type": "string", "description": "Nome do record (ex: JOB, PERSONAL_DATA)"},
-                    "include_fields": {"type": "boolean", "description": "Incluir lista de fields", "default": True},
-                },
-                "required": ["recname"],
-            },
-        ),
-        types.Tool(
-            name="get_peoplecode",
-            description=(
-                "Extrai texto de PeopleCode de PSPCMPROG + PSPCMTXT. "
-                "Permite filtrar por object, field/section e event name."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "objectid1":  {"type": "string", "description": "Record ou AE Application (ex: JOB, AE_APP)"},
-                    "objectid2":  {"type": "string", "description": "Field ou Section (ex: EMPLID, MAIN_SECTION)"},
-                    "event_name": {"type": "string", "description": "Evento PeopleCode (ex: FieldChange, SavePreChange)"},
-                },
-                "required": ["objectid1"],
-            },
-        ),
-        types.Tool(
-            name="search_references",
-            description=(
-                "Busca onde um field ou record é referenciado em PSPCMPROG, "
-                "PSRECFIELD e PSAESTEPDEFN."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "field_or_record": {"type": "string", "description": "Nome do field ou record"},
-                    "search_type":     {"type": "string", "enum": ["field", "record", "both"], "default": "both"},
-                },
-                "required": ["field_or_record"],
-            },
-        ),
-        types.Tool(
-            name="run_safe_query",
-            description=(
-                "Executa apenas SELECT em whitelist de tabelas PeopleSoft autorizadas. "
-                "Bloqueia qualquer DML (INSERT/UPDATE/DELETE/DROP/TRUNCATE)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sql":      {"type": "string", "description": "Instrução SELECT"},
-                    "max_rows": {"type": "integer", "description": "Máximo de linhas retornadas", "default": 100},
-                },
-                "required": ["sql"],
-            },
-        ),
-        types.Tool(
-            name="suggest_change",
-            description=(
-                "Analisa impacto de uma mudança proposta buscando referências no Oracle "
-                "e gera sugestão comentada com passos de implementação."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target":      {"type": "string", "description": "Record ou field alvo"},
-                    "change_desc": {"type": "string", "description": "Descrição da mudança proposta"},
-                    "change_type": {
-                        "type": "string",
-                        "enum": ["field_add", "field_modify", "record_add", "peoplecode", "ae_step"],
-                        "description": "Tipo de mudança",
-                    },
-                },
-                "required": ["target", "change_desc", "change_type"],
-            },
-        ),
-        types.Tool(
-            name="get_workflow_def",
-            description="Consulta PSACTIVITY e PSROUTE para retornar definição de workflow PeopleSoft.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "business_process": {"type": "string", "description": "Nome do Business Process"},
-                    "activity":         {"type": "string", "description": "Nome da Activity"},
-                },
-                "required": ["business_process"],
-            },
-        ),
-        types.Tool(
-            name="get_ib_service",
-            description=(
-                "Introspecta PSIBSVCSETUP, PSIBSUBDEFN e PSMSGNODEDEFN "
-                "para detalhes do Integration Broker."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service_name": {"type": "string", "description": "Nome do serviço IB"},
-                    "node_name":    {"type": "string", "description": "Nome do node (opcional)"},
-                },
-                "required": ["service_name"],
-            },
-        ),
-        types.Tool(
-            name="export_knowledge",
-            description=(
-                "Exporta conhecimento acumulado (metadados + referências de trace) "
-                "em markdown ou JSON para knowledge/exports/."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "topic":  {"type": "string", "description": "Tópico ou filtro para exportar"},
-                    "format": {"type": "string", "enum": ["markdown", "json"], "default": "markdown"},
-                },
-                "required": ["topic"],
-            },
-        ),
-    ]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-
-    # ── Tool 1: trace_workflow ─────────────────────────────────────────────────
-    if name == "trace_workflow":
-        trace_file = arguments["trace_file"]
-        query      = arguments.get("query", "")
-        top_slow   = int(arguments.get("top_slow", 10))
-
-        fpath = TRACES_DIR / trace_file
-        if not fpath.exists():
-            return [types.TextContent(type="text", text=f"Arquivo não encontrado: {fpath}")]
-
-        raw = fpath.read_text(encoding="utf-8", errors="replace")
-
-        # Parse: quebra por Section/Step e extrai Elapsed Time
-        chunks = []
-        current_section = ""
-        current_step    = ""
-        current_lines   = []
-        elapsed_pattern = re.compile(r"Elapsed\s+Time\s*[:=]\s*([\d.]+)", re.IGNORECASE)
-
-        for line in raw.splitlines():
-            sec_m = re.match(r"^\s*Section\s*[:\-]?\s*(.+)", line, re.IGNORECASE)
-            stp_m = re.match(r"^\s*Step\s*[:\-]?\s*(.+)",    line, re.IGNORECASE)
-
-            if sec_m:
-                if current_lines:
-                    txt = "\n".join(current_lines)
-                    elapsed_vals = [float(x) for x in elapsed_pattern.findall(txt)]
-                    elapsed = max(elapsed_vals) if elapsed_vals else 0.0
-                    chunks.append((current_section, current_step, elapsed, txt))
-                current_section = sec_m.group(1).strip()
-                current_step    = ""
-                current_lines   = [line]
-            elif stp_m:
-                if current_lines:
-                    txt = "\n".join(current_lines)
-                    elapsed_vals = [float(x) for x in elapsed_pattern.findall(txt)]
-                    elapsed = max(elapsed_vals) if elapsed_vals else 0.0
-                    chunks.append((current_section, current_step, elapsed, txt))
-                current_step  = stp_m.group(1).strip()
-                current_lines = [line]
-            else:
-                current_lines.append(line)
-
-        if current_lines:
-            txt = "\n".join(current_lines)
-            elapsed_vals = [float(x) for x in elapsed_pattern.findall(txt)]
-            elapsed = max(elapsed_vals) if elapsed_vals else 0.0
-            chunks.append((current_section, current_step, elapsed, txt))
-
-        # Indexa no SQLite FTS5
-        conn = get_sqlite_conn()
-        cur  = conn.cursor()
-        cur.execute("DELETE FROM trace_chunks WHERE trace_file = ?", (trace_file,))
-        now  = datetime.datetime.utcnow().isoformat()
-        for sec, stp, elapsed, content in chunks:
-            cur.execute(
-                "INSERT INTO trace_chunks (trace_file, section, step, elapsed, content, indexed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (trace_file, sec, stp, elapsed, content, now),
-            )
-        # Rebuild FTS
-        cur.execute("INSERT INTO trace_fts(trace_fts) VALUES('rebuild')")
-        conn.commit()
-
-        result_lines = [f"✅ {len(chunks)} chunks indexados de '{trace_file}'."]
-
-        # Busca FTS
-        if query:
-            rows = cur.execute(
-                "SELECT section, step, elapsed, snippet(trace_fts,3,'>>','<<','…',20) AS snip "
-                "FROM trace_fts WHERE trace_fts MATCH ? LIMIT 20",
-                (query,),
-            ).fetchall()
-            result_lines.append(f"\n🔍 Resultados para '{query}':")
-            for r in rows:
-                result_lines.append(f"  [{r['section']} / {r['step']}] {r['elapsed']:.3f}s — {r['snip']}")
-
-        # Top slow steps
-        slow = cur.execute(
-            "SELECT section, step, elapsed FROM trace_chunks WHERE trace_file=? "
-            "ORDER BY elapsed DESC LIMIT ?",
-            (trace_file, top_slow),
-        ).fetchall()
-        result_lines.append(f"\n🐢 Top {top_slow} steps mais lentos:")
-        for r in slow:
-            result_lines.append(f"  [{r['section']} / {r['step']}] {r['elapsed']:.3f}s")
-
-        conn.close()
-        return [types.TextContent(type="text", text="\n".join(result_lines))]
-
-    # ── Tool 2: get_table_metadata ─────────────────────────────────────────────
-    elif name == "get_table_metadata":
-        recname        = arguments["recname"].upper()
-        include_fields = arguments.get("include_fields", True)
-
-        # Verifica cache
-        conn = get_sqlite_conn()
-        cached = conn.execute(
-            "SELECT payload FROM metadata_cache WHERE recname=?", (recname,)
-        ).fetchone()
-        conn.close()
-
-        if cached:
-            return [types.TextContent(type="text", text=f"[CACHE]\n{cached['payload']}")]
-
+    if include_fields:
         try:
-            rec = oracle_query(
-                "SELECT RECNAME, RECDESCR, RECTYPE, FIELDCOUNT, AUDITRECNAME "
-                "FROM PSRECDEFN WHERE RECNAME = :r",
-                {"r": recname},
+            fields = _oracle_query(
+                """
+                SELECT f.FIELDNAME, f.FIELDNUM, f.FIELDTYPE, f.LENGTH,
+                       d.LONGNAME, f.USEEDIT
+                FROM PSRECFIELD f
+                JOIN PSDBFIELD d ON d.FIELDNAME = f.FIELDNAME
+                WHERE f.RECNAME = :recname
+                ORDER BY f.FIELDNUM
+                """,
+                {"recname": clean},
             )
-            if not rec:
-                return [types.TextContent(type="text", text=f"Record '{recname}' não encontrado.")]
+            result["fields"] = fields
+        except Exception as e:
+            result["fields_error"] = str(e)
 
-            lines = [f"## Record: {recname}", f"Descrição : {rec[0].get('RECDESCR','')}",
-                     f"Tipo      : {rec[0].get('RECTYPE','')}",
-                     f"Qtd Fields: {rec[0].get('FIELDCOUNT','')}"]
+    # Salvar cache
+    conn = _get_sqlite()
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata_cache (recname, payload, cached_at) VALUES (?,?,?)",
+        (clean, json.dumps(result, default=str), datetime.datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
-            if include_fields:
-                fields = oracle_query(
-                    "SELECT f.FIELDNAME, f.FIELDTYPE, f.LENGTH, f.DECIMALPOS, "
-                    "       d.LONGNAME, f.USEEDIT, f.FIELDNUM "
-                    "FROM PSRECFIELD f "
-                    "JOIN PSDBFIELD d ON d.FIELDNAME = f.FIELDNAME "
-                    "WHERE f.RECNAME = :r ORDER BY f.FIELDNUM",
-                    {"r": recname},
-                )
-                lines.append("\n### Fields:")
-                for fld in fields:
-                    lines.append(
-                        f"  {fld['FIELDNUM']:3}. {fld['FIELDNAME']:<30} "
-                        f"type={fld['FIELDTYPE']} len={fld['LENGTH']} "
-                        f"| {fld.get('LONGNAME','')}"
-                    )
+    return result
 
-            payload = "\n".join(lines)
 
-            # Salva cache
-            conn = get_sqlite_conn()
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata_cache (recname, payload, cached_at) VALUES (?,?,?)",
-                (recname, payload, datetime.datetime.utcnow().isoformat()),
-            )
-            conn.commit()
-            conn.close()
+@mcp.tool()
+async def get_peoplecode(
+    objectid1: str,
+    objectid2: str | None = None,
+    event_name: str | None = None,
+) -> dict:
+    """
+    Extrai texto de PeopleCode de PSPCMPROG + PSPCMTXT.
 
-            return [types.TextContent(type="text", text=payload)]
+    Use para ler o código de eventos como FieldChange, SavePreChange,
+    ou código de Application Engine.
 
-        except ConnectionError as e:
-            return [types.TextContent(type="text", text=str(e))]
+    Args:
+        objectid1:  Record ou AE Application (ex: 'JOB', 'TL_TA')
+        objectid2:  Field ou Section (ex: 'EMPLID', 'MAIN')
+        event_name: Evento PeopleCode (ex: 'FieldChange', 'SavePreChange')
 
-    # ── Tool 3: get_peoplecode ─────────────────────────────────────────────────
-    elif name == "get_peoplecode":
-        objectid1  = arguments["objectid1"].upper()
-        objectid2  = arguments.get("objectid2", "").upper()
-        event_name = arguments.get("event_name", "").upper()
+    Returns:
+        Texto completo do PeopleCode para os objetos encontrados.
+    """
+    sql = """
+        SELECT p.OBJECTVALUE1, p.OBJECTVALUE2, p.OBJECTVALUE3,
+               t.PCMPTEXT
+        FROM PSPCMPROG p
+        JOIN PSPCMTXT  t ON t.OBJECTID1    = p.OBJECTID1
+                        AND t.OBJECTVALUE1 = p.OBJECTVALUE1
+        WHERE p.OBJECTVALUE1 = :objectid1
+    """
+    params: dict[str, Any] = {"objectid1": objectid1.upper()}
+    if objectid2:
+        sql += " AND p.OBJECTVALUE2 = :objectid2"
+        params["objectid2"] = objectid2.upper()
+    if event_name:
+        sql += " AND UPPER(p.OBJECTVALUE3) = UPPER(:event_name)"
+        params["event_name"] = event_name
 
+    try:
+        rows = _oracle_query(sql, params)
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {
+        "object": objectid1,
+        "count":  len(rows),
+        "results": rows,
+    }
+
+
+@mcp.tool()
+async def search_references(field_or_record: str, search_type: str = "both") -> dict:
+    """
+    Busca onde um field ou record é referenciado em PeopleCode, AE e RecField.
+
+    Útil para análise de impacto antes de modificar um campo ou tabela.
+
+    Args:
+        field_or_record: Nome do field ou record a buscar
+        search_type:     'field', 'record' ou 'both' (padrão)
+
+    Returns:
+        Referências em PeopleCode (PSPCMPROG), AE (PSAESTEPDEFN) e RecField (PSRECFIELD).
+    """
+    term   = field_or_record.upper()
+    result = {"term": term, "references": {}}
+
+    if search_type in ("field", "both"):
         try:
-            sql = (
-                "SELECT p.OBJECTID1, p.OBJECTID2, p.OBJECTID3, p.OBJECTVALUE1, "
-                "       p.OBJECTVALUE2, p.OBJECTVALUE3, t.PCMPTEXT "
-                "FROM PSPCMPROG p "
-                "JOIN PSPCMTXT  t ON t.OBJECTID1=p.OBJECTID1 "
-                "                AND t.OBJECTVALUE1=p.OBJECTVALUE1 "
-                "WHERE p.OBJECTVALUE1 = :oid1"
-            )
-            params: dict = {"oid1": objectid1}
-            if objectid2:
-                sql += " AND p.OBJECTVALUE2 = :oid2"
-                params["oid2"] = objectid2
-            if event_name:
-                sql += " AND UPPER(p.OBJECTVALUE3) = :ev"
-                params["ev"] = event_name
-
-            rows = oracle_query(sql, params, max_rows=50)
-            if not rows:
-                return [types.TextContent(type="text", text="Nenhum PeopleCode encontrado para os filtros informados.")]
-
-            lines = []
-            for r in rows:
-                lines.append(
-                    f"--- {r.get('OBJECTVALUE1','')} / {r.get('OBJECTVALUE2','')} / {r.get('OBJECTVALUE3','')} ---"
-                )
-                lines.append(r.get("PCMPTEXT", ""))
-                lines.append("")
-
-            return [types.TextContent(type="text", text="\n".join(lines))]
-
-        except ConnectionError as e:
-            return [types.TextContent(type="text", text=str(e))]
-
-    # ── Tool 4: search_references ──────────────────────────────────────────────
-    elif name == "search_references":
-        target      = arguments["field_or_record"].upper()
-        search_type = arguments.get("search_type", "both")
-
-        results: list[str] = [f"## Referências para: {target}\n"]
-
-        try:
-            # PeopleCode references
-            if search_type in ("field", "both"):
-                pc_rows = oracle_query(
-                    "SELECT OBJECTVALUE1, OBJECTVALUE2, OBJECTVALUE3 FROM PSPCMPROG "
-                    "WHERE UPPER(PCMPTEXT) LIKE :pat",
-                    {"pat": f"%{target}%"},
-                    max_rows=200,
-                )
-                results.append(f"### PSPCMPROG ({len(pc_rows)} ocorrências):")
-                for r in pc_rows[:50]:
-                    results.append(f"  {r['OBJECTVALUE1']} / {r['OBJECTVALUE2']} / {r['OBJECTVALUE3']}")
-
-            # PSRECFIELD
-            if search_type in ("record", "both"):
-                rec_rows = oracle_query(
-                    "SELECT RECNAME, FIELDNAME, FIELDNUM FROM PSRECFIELD "
-                    "WHERE RECNAME=:t OR FIELDNAME=:t",
-                    {"t": target},
-                    max_rows=200,
-                )
-                results.append(f"\n### PSRECFIELD ({len(rec_rows)} ocorrências):")
-                for r in rec_rows[:50]:
-                    results.append(f"  {r['RECNAME']}.{r['FIELDNAME']} (pos {r['FIELDNUM']})")
-
-            # PSAESTEPDEFN
-            ae_rows = oracle_query(
-                "SELECT AE_APPLID, AE_SECTION, AESTEPNUM, STMTTYPE FROM PSAESTEPDEFN "
-                "WHERE UPPER(PCMPROG) LIKE :pat OR UPPER(STMTTEXT) LIKE :pat",
-                {"pat": f"%{target}%"},
+            pc_rows = _oracle_query(
+                "SELECT OBJECTVALUE1, OBJECTVALUE2, OBJECTVALUE3 FROM PSPCMPROG "
+                "WHERE UPPER(PCMPTEXT) LIKE :pat",
+                {"pat": f"%{term}%"},
                 max_rows=100,
             )
-            results.append(f"\n### PSAESTEPDEFN ({len(ae_rows)} ocorrências):")
-            for r in ae_rows[:30]:
-                results.append(f"  {r['AE_APPLID']}.{r['AE_SECTION']}.{r['AESTEPNUM']} type={r['STMTTYPE']}")
+            result["references"]["peoplecode"] = pc_rows
+        except Exception as e:
+            result["references"]["peoplecode_error"] = str(e)
 
-        except ConnectionError as e:
-            results.append(str(e))
-
-        return [types.TextContent(type="text", text="\n".join(results))]
-
-    # ── Tool 5: run_safe_query ─────────────────────────────────────────────────
-    elif name == "run_safe_query":
-        sql      = arguments["sql"].strip()
-        max_rows = int(arguments.get("max_rows", 100))
-
-        # Bloqueia DML
-        dml_pattern = re.compile(
-            r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|MERGE|EXEC|EXECUTE)\b",
-            re.IGNORECASE,
-        )
-        if dml_pattern.search(sql):
-            return [types.TextContent(type="text", text="❌ DML não permitido. Apenas SELECT é aceito.")]
-
-        # Verifica tabelas na whitelist
-        tables_used = re.findall(r"\bFROM\s+(\w+)|\bJOIN\s+(\w+)", sql, re.IGNORECASE)
-        flat_tables = {t.upper() for pair in tables_used for t in pair if t}
-        blocked = flat_tables - ALLOWED_TABLES
-        if blocked:
-            return [types.TextContent(
-                type="text",
-                text=f"❌ Tabelas não autorizadas: {', '.join(blocked)}.\n"
-                     f"Permitidas: {', '.join(sorted(ALLOWED_TABLES))}",
-            )]
-
+    if search_type in ("record", "both"):
         try:
-            rows = oracle_query(sql, max_rows=max_rows)
-            if not rows:
-                return [types.TextContent(type="text", text="Consulta retornou 0 linhas.")]
-
-            # Formata como tabela
-            cols  = list(rows[0].keys())
-            widths = {c: max(len(c), max(len(str(r.get(c,""))) for r in rows)) for c in cols}
-            header = " | ".join(c.ljust(widths[c]) for c in cols)
-            sep    = "-+-".join("-" * widths[c] for c in cols)
-            lines  = [header, sep]
-            for r in rows:
-                lines.append(" | ".join(str(r.get(c,"")).ljust(widths[c]) for c in cols))
-            lines.append(f"\n({len(rows)} linhas)")
-            return [types.TextContent(type="text", text="\n".join(lines))]
-
-        except ConnectionError as e:
-            return [types.TextContent(type="text", text=str(e))]
-
-    # ── Tool 6: suggest_change ─────────────────────────────────────────────────
-    elif name == "suggest_change":
-        target      = arguments["target"].upper()
-        change_desc = arguments["change_desc"]
-        change_type = arguments["change_type"]
-
-        lines = [
-            f"# Análise de Impacto: {change_type} em {target}",
-            f"**Mudança proposta:** {change_desc}\n",
-            "## 1. Referências encontradas",
-        ]
-
-        try:
-            # PeopleCode references
-            pc = oracle_query(
-                "SELECT OBJECTVALUE1, OBJECTVALUE2, OBJECTVALUE3 FROM PSPCMPROG "
-                "WHERE UPPER(PCMPTEXT) LIKE :p",
-                {"p": f"%{target}%"}, max_rows=100,
-            )
-            lines.append(f"- **PeopleCode**: {len(pc)} programas referenciando `{target}`")
-
-            # AE Steps
-            ae = oracle_query(
+            ae_rows = _oracle_query(
                 "SELECT AE_APPLID, AE_SECTION, AESTEPNUM FROM PSAESTEPDEFN "
-                "WHERE UPPER(STMTTEXT) LIKE :p OR UPPER(PCMPROG) LIKE :p",
-                {"p": f"%{target}%"}, max_rows=100,
+                "WHERE UPPER(STMTTEXT) LIKE :pat",
+                {"pat": f"%{term}%"},
+                max_rows=100,
             )
-            lines.append(f"- **AE Steps**: {len(ae)} steps referenciando `{target}`")
+            result["references"]["application_engine"] = ae_rows
+        except Exception as e:
+            result["references"]["ae_error"] = str(e)
 
-            # Record fields
-            rf = oracle_query(
-                "SELECT RECNAME FROM PSRECFIELD WHERE RECNAME=:t OR FIELDNAME=:t",
-                {"t": target}, max_rows=100,
-            )
-            lines.append(f"- **PSRECFIELD**: {len(rf)} records/fields com `{target}`")
+    try:
+        rf_rows = _oracle_query(
+            "SELECT RECNAME FROM PSRECFIELD WHERE FIELDNAME = :term",
+            {"term": term},
+            max_rows=200,
+        )
+        result["references"]["record_field"] = rf_rows
+    except Exception as e:
+        result["references"]["record_field_error"] = str(e)
 
-        except ConnectionError as e:
-            lines.append(f"⚠ Não foi possível consultar o Oracle: {e}")
-            pc, ae, rf = [], [], []
+    return result
 
-        lines += [
-            "\n## 2. Passos sugeridos de implementação",
-        ]
 
-        steps_map = {
-            "field_add": [
-                f"1. Adicionar field `{target}` ao record via App Designer.",
-                "2. Executar build da tabela (alter table).",
-                f"3. Atualizar PeopleCode relevante: {len(pc)} programas a revisar.",
-                "4. Verificar pages e componentes que exibem o record.",
-                "5. Atualizar Data Mover scripts se necessário.",
-                "6. Testar em ambiente de desenvolvimento antes de migrar.",
-            ],
-            "field_modify": [
-                f"1. Avaliar impacto em {len(pc)} programas PeopleCode.",
-                f"2. Revisar {len(ae)} AE steps para compatibilidade.",
-                "3. Modificar o field no App Designer com cuidado ao type/length.",
-                "4. Executar build ALTER TABLE.",
-                "5. Atualizar traduções/labels se aplicável.",
-                "6. Testar formulários e processos batch.",
-            ],
-            "record_add": [
-                f"1. Criar record `{target}` no App Designer.",
-                "2. Definir keys e fields necessários.",
-                "3. Executar build CREATE TABLE.",
-                "4. Criar Data Mover script para dados iniciais.",
-                "5. Adicionar permissões de segurança.",
-                "6. Documentar no README do projeto.",
-            ],
-            "peoplecode": [
-                f"1. Abrir PeopleCode de `{target}` no App Designer.",
-                f"2. Aplicar mudança: {change_desc}",
-                "3. Compilar e validar sem erros.",
-                f"4. Revisar {len(pc)} outros programas relacionados.",
-                "5. Testar evento acionador manualmente.",
-                "6. Migrar via project em ambiente de QA.",
-            ],
-            "ae_step": [
-                f"1. Abrir Application Engine `{target}` no App Designer.",
-                f"2. Localizar e modificar step: {change_desc}",
-                f"3. Revisar {len(ae)} steps relacionados.",
-                "4. Executar AE em modo de trace para validar.",
-                "5. Verificar PSAEAPPLSTATE para reinicialização correta.",
-                "6. Migrar e testar em QA.",
-            ],
+@mcp.tool()
+async def run_safe_query(sql: str, max_rows: int = 100) -> dict:
+    """
+    Executa SELECT em tabelas PeopleSoft autorizadas (whitelist de segurança).
+
+    Bloqueia qualquer DML (INSERT, UPDATE, DELETE, DROP, TRUNCATE).
+    Use para exploração ad-hoc do banco sem risco de modificação acidental.
+
+    Args:
+        sql:      Instrução SELECT (apenas leitura)
+        max_rows: Número máximo de linhas retornadas (padrão: 100)
+
+    Returns:
+        Resultados da query ou mensagem de erro/bloqueio.
+    """
+    upper_sql = sql.upper().strip()
+
+    # Bloquear DML
+    for dml in ("INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "MERGE", "CREATE", "ALTER"):
+        if re.search(rf"\b{dml}\b", upper_sql):
+            return {"error": f"Operação '{dml}' bloqueada. Apenas SELECT é permitido."}
+
+    # Verificar whitelist
+    tables_in_query = set(re.findall(r"\bPS[_\.](\w+)\b", upper_sql))
+    raw_tables      = set(re.findall(r"\bFROM\s+(\w+)\b|\bJOIN\s+(\w+)\b", upper_sql))
+    all_tables      = tables_in_query | {t for pair in raw_tables for t in pair if t}
+
+    blocked = all_tables - ALLOWED_TABLES
+    if blocked and not any(t in ALLOWED_TABLES for t in all_tables):
+        return {
+            "warning": f"Tabelas fora da whitelist: {blocked}. Query executada com cautela.",
+            "allowed_tables": sorted(ALLOWED_TABLES),
         }
 
-        for step in steps_map.get(change_type, ["Tipo de mudança não mapeado."]):
-            lines.append(step)
-
-        lines += [
-            "\n## 3. Riscos",
-            f"- Total de dependências identificadas: {len(pc)+len(ae)+len(rf)}",
-            "- Recomendado: backup completo antes de executar em produção.",
-            "- Validar com equipe de QA após cada etapa.",
-        ]
-
-        return [types.TextContent(type="text", text="\n".join(lines))]
-
-    # ── Tool 7: get_workflow_def ───────────────────────────────────────────────
-    elif name == "get_workflow_def":
-        bp       = arguments["business_process"].upper()
-        activity = arguments.get("activity", "").upper()
-
-        try:
-            act_sql = (
-                "SELECT BUSPROCNAME, ACTIVITYNAME, DESCR, STATUS "
-                "FROM PSACTIVITY WHERE BUSPROCNAME=:bp"
-            )
-            params: dict = {"bp": bp}
-            if activity:
-                act_sql += " AND ACTIVITYNAME=:act"
-                params["act"] = activity
-
-            activities = oracle_query(act_sql, params, max_rows=50)
-
-            lines = [f"## Workflow: {bp}", f"Activities encontradas: {len(activities)}\n"]
-            for a in activities:
-                lines.append(f"### Activity: {a['ACTIVITYNAME']}")
-                lines.append(f"  Descrição: {a.get('DESCR','')}")
-                lines.append(f"  Status   : {a.get('STATUS','')}")
-
-                routes = oracle_query(
-                    "SELECT ROUTEDEFN, ROUTETYPE, DESCR FROM PSROUTE "
-                    "WHERE BUSPROCNAME=:bp AND ACTIVITYNAME=:act",
-                    {"bp": bp, "act": a["ACTIVITYNAME"]},
-                )
-                if routes:
-                    lines.append("  Routes:")
-                    for r in routes:
-                        lines.append(f"    - {r['ROUTEDEFN']} ({r.get('ROUTETYPE','')}) {r.get('DESCR','')}")
-                lines.append("")
-
-            return [types.TextContent(type="text", text="\n".join(lines))]
-
-        except ConnectionError as e:
-            return [types.TextContent(type="text", text=str(e))]
-
-    # ── Tool 8: get_ib_service ─────────────────────────────────────────────────
-    elif name == "get_ib_service":
-        service_name = arguments["service_name"].upper()
-        node_name    = arguments.get("node_name", "").upper()
-
-        try:
-            svc = oracle_query(
-                "SELECT IBSERVICENAME, DESCR, SERVICETYPE, CONTVERSIONNUMBER "
-                "FROM PSIBSVCSETUP WHERE IBSERVICENAME=:s",
-                {"s": service_name},
-            )
-            lines = [f"## Integration Broker Service: {service_name}"]
-            if svc:
-                lines.append(f"Descrição : {svc[0].get('DESCR','')}")
-                lines.append(f"Tipo      : {svc[0].get('SERVICETYPE','')}")
-                lines.append(f"Versão    : {svc[0].get('CONTVERSIONNUMBER','')}")
-            else:
-                lines.append("Serviço não encontrado em PSIBSVCSETUP.")
-
-            # Subscriptions
-            subs_sql = "SELECT IBSUBNAME, SUBTYPE, DESCR FROM PSIBSUBDEFN WHERE IBSERVICENAME=:s"
-            subs = oracle_query(subs_sql, {"s": service_name})
-            lines.append(f"\n### Subscriptions ({len(subs)}):")
-            for s in subs:
-                lines.append(f"  - {s['IBSUBNAME']} ({s.get('SUBTYPE','')}) {s.get('DESCR','')}")
-
-            # Nodes
-            node_sql = "SELECT MSGNODENAME, DESCR, DEFAULTMSGNODE FROM PSMSGNODEDEFN"
-            if node_name:
-                node_sql += " WHERE MSGNODENAME=:n"
-                nodes = oracle_query(node_sql, {"n": node_name})
-            else:
-                nodes = oracle_query(node_sql, max_rows=20)
-            lines.append(f"\n### Nodes ({len(nodes)}):")
-            for n in nodes:
-                lines.append(f"  - {n['MSGNODENAME']} {n.get('DESCR','')} default={n.get('DEFAULTMSGNODE','')}")
-
-            return [types.TextContent(type="text", text="\n".join(lines))]
-
-        except ConnectionError as e:
-            return [types.TextContent(type="text", text=str(e))]
-
-    # ── Tool 9: export_knowledge ───────────────────────────────────────────────
-    elif name == "export_knowledge":
-        topic  = arguments["topic"]
-        fmt    = arguments.get("format", "markdown")
-
-        conn = get_sqlite_conn()
-        meta_rows = conn.execute(
-            "SELECT recname, payload, cached_at FROM metadata_cache WHERE UPPER(recname) LIKE UPPER(?)",
-            (f"%{topic}%",),
-        ).fetchall()
-
-        trace_rows = conn.execute(
-            "SELECT trace_file, section, step, elapsed, content FROM trace_chunks "
-            "WHERE UPPER(content) LIKE UPPER(?) LIMIT 50",
-            (f"%{topic}%",),
-        ).fetchall()
-
-        notes_rows = conn.execute(
-            "SELECT topic, category, content, created_at FROM knowledge_notes "
-            "WHERE UPPER(topic) LIKE UPPER(?) LIMIT 50",
-            (f"%{topic}%",),
-        ).fetchall()
-        conn.close()
-
-        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        safe_topic = re.sub(r"[^\w]", "_", topic)
-        filename   = EXPORTS_DIR / f"{safe_topic}_{timestamp}.{('md' if fmt=='markdown' else 'json')}"
-
-        if fmt == "json":
-            export_data = {
-                "topic": topic,
-                "exported_at": timestamp,
-                "metadata_cache": [dict(r) for r in meta_rows],
-                "trace_chunks":   [dict(r) for r in trace_rows],
-                "notes":          [dict(r) for r in notes_rows],
-            }
-            filename.write_text(json.dumps(export_data, indent=2, default=str), encoding="utf-8")
-        else:
-            lines = [
-                f"# Exportação de Conhecimento: {topic}",
-                f"_Exportado em: {timestamp}_\n",
-                f"## Metadados Cacheados ({len(meta_rows)} records)",
-            ]
-            for r in meta_rows:
-                lines.append(f"\n### {r['recname']}")
-                lines.append(r["payload"])
-
-            lines.append(f"\n## Trace Chunks ({len(trace_rows)} trechos)")
-            for r in trace_rows:
-                lines.append(f"\n**{r['trace_file']}** | {r['section']} / {r['step']} | {r['elapsed']:.3f}s")
-                lines.append(f"```\n{r['content'][:500]}\n```")
-
-            lines.append(f"\n## Notas ({len(notes_rows)})")
-            for r in notes_rows:
-                lines.append(f"\n**{r['topic']}** [{r.get('category','')}] _{r.get('created_at','')}_")
-                lines.append(r["content"])
-
-            filename.write_text("\n".join(lines), encoding="utf-8")
-
-        return [types.TextContent(
-            type="text",
-            text=f"✅ Exportado: {filename}\n"
-                 f"  {len(meta_rows)} records | {len(trace_rows)} trace chunks | {len(notes_rows)} notas",
-        )]
-
-    else:
-        return [types.TextContent(type="text", text=f"Ferramenta desconhecida: {name}")]
+    try:
+        rows = _oracle_query(sql, max_rows=max_rows)
+        return {"row_count": len(rows), "results": rows}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ══════════════════════════════════════════════════════════════════════════════
-async def main():
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
+@mcp.tool()
+async def suggest_change(
+    target: str,
+    change_desc: str,
+    change_type: str,
+) -> dict:
+    """
+    Analisa o impacto de uma mudança proposta e sugere passos de implementação.
+
+    Busca referências do target no banco (PeopleCode, AE, RecField) e gera
+    um plano de implementação comentado com riscos e dependências.
+
+    Args:
+        target:      Record ou field alvo da mudança (ex: 'PS_TL_IPT', 'TRC')
+        change_desc: Descrição da mudança (ex: 'Adicionar condição de grupo')
+        change_type: Tipo: 'field_add', 'field_modify', 'record_add', 'peoplecode', 'ae_step'
+
+    Returns:
+        Análise de impacto + plano de implementação.
+    """
+    refs = await search_references(target, "both")
+
+    pc_count  = len(refs.get("references", {}).get("peoplecode", []))
+    ae_count  = len(refs.get("references", {}).get("application_engine", []))
+    rf_count  = len(refs.get("references", {}).get("record_field", []))
+
+    risk = "ALTO" if (pc_count + ae_count) > 10 else "MÉDIO" if (pc_count + ae_count) > 3 else "BAIXO"
+
+    steps_map = {
+        "field_add":     ["Criar field em App Designer", "Adicionar ao record", "Build do record", "Atualizar PeopleCode se necessário", "Testar em homologação"],
+        "field_modify":  ["Analisar impacto nos objetos referenciados", "Modificar field em App Designer", "Rebuild do record", "Atualizar queries/PeopleCode dependentes", "Testar"],
+        "record_add":    ["Criar record em App Designer", "Definir keys e indexes", "Build SQL Table", "Criar PeopleCode/AE se necessário", "Testar"],
+        "peoplecode":    ["Identificar evento e objeto", "Editar PeopleCode em App Designer", "Salvar e verificar sintaxe", "Testar com dados reais"],
+        "ae_step":       ["Identificar Section/Step do AE", "Modificar SQL ou PeopleCode do step", "Testar com Process Scheduler", "Validar lançamentos gerados"],
+    }
+
+    return {
+        "target":       target,
+        "change_desc":  change_desc,
+        "change_type":  change_type,
+        "risk_level":   risk,
+        "impact": {
+            "peoplecode_references": pc_count,
+            "ae_references":         ae_count,
+            "record_field_refs":     rf_count,
+        },
+        "implementation_steps": steps_map.get(change_type, ["Consultar documentação Oracle PeopleTools"]),
+        "references_detail":    refs.get("references", {}),
+    }
+
+
+@mcp.tool()
+async def get_workflow_def(business_process: str, activity: str | None = None) -> dict:
+    """
+    Retorna definição de Workflow PeopleSoft (PSACTIVITY + PSROUTE).
+
+    Args:
+        business_process: Nome do Business Process
+        activity:         Nome da Activity (opcional)
+
+    Returns:
+        Activities e Routes do workflow.
+    """
+    sql = "SELECT BUSPROCNAME, ACTIVITYNAME, DESCR, STATUS FROM PSACTIVITY WHERE BUSPROCNAME = :bp"
+    params: dict[str, Any] = {"bp": business_process}
+    if activity:
+        sql += " AND ACTIVITYNAME = :act"
+        params["act"] = activity
+
+    try:
+        activities = _oracle_query(sql, params)
+        routes     = _oracle_query(
+            "SELECT BUSPROCNAME, ACTIVITYNAME, ROUTENAME, DESCR FROM PSROUTE WHERE BUSPROCNAME = :bp",
+            {"bp": business_process},
         )
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {
+        "business_process": business_process,
+        "activities":       activities,
+        "routes":           routes,
+    }
 
 
+@mcp.tool()
+async def get_ib_service(service_name: str, node_name: str | None = None) -> dict:
+    """
+    Retorna detalhes do Integration Broker para um serviço.
+
+    Consulta PSIBSVCSETUP, PSIBSUBDEFN e PSMSGNODEDEFN.
+
+    Args:
+        service_name: Nome do serviço IB
+        node_name:    Nome do node (opcional)
+
+    Returns:
+        Setup do serviço, subscriptions e nodes configurados.
+    """
+    try:
+        svc  = _oracle_query(
+            "SELECT IBSERVICENAME, DESCR, SERVICETYPE FROM PSIBSVCSETUP WHERE IBSERVICENAME = :svc",
+            {"svc": service_name},
+        )
+        subs = _oracle_query(
+            "SELECT IBSUBNAME, SUBTYPE, DESCR FROM PSIBSUBDEFN WHERE IBSERVICENAME = :svc",
+            {"svc": service_name},
+        )
+        node_sql    = "SELECT MSGNODENAME, DESCR, DEFAULTMSGNODE FROM PSMSGNODEDEFN"
+        node_params = {}
+        if node_name:
+            node_sql += " WHERE MSGNODENAME = :node"
+            node_params["node"] = node_name
+        nodes = _oracle_query(node_sql, node_params)
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {"service": svc, "subscriptions": subs, "nodes": nodes}
+
+
+@mcp.tool()
+async def export_knowledge(topic: str, format: str = "markdown") -> dict:
+    """
+    Exporta o conhecimento acumulado (traces indexados + notas) em markdown ou JSON.
+
+    Args:
+        topic:  Filtro por tópico (ex: 'TL_TA', 'overtime', 'SEMESTRAL')
+        format: 'markdown' (padrão) ou 'json'
+
+    Returns:
+        Caminho do arquivo exportado + preview do conteúdo.
+    """
+    conn    = _get_sqlite()
+    chunks  = conn.execute(
+        "SELECT trace_file, section, step, content FROM trace_chunks WHERE content LIKE ?",
+        (f"%{topic}%",),
+    ).fetchall()
+    notes   = conn.execute(
+        "SELECT topic, category, content FROM knowledge_notes WHERE topic LIKE ?",
+        (f"%{topic}%",),
+    ).fetchall()
+    conn.close()
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename  = EXPORTS_DIR / f"export_{topic}_{timestamp}.{format}"
+
+    if format == "markdown":
+        content = f"# Knowledge Export: {topic}\n\n"
+        content += f"Gerado em: {datetime.datetime.now().isoformat()}\n\n"
+        if chunks:
+            content += "## Trace Chunks\n\n"
+            for c in chunks:
+                content += f"### {c['trace_file']} — {c['section']}.{c['step']}\n```\n{c['content'][:500]}\n```\n\n"
+        if notes:
+            content += "## Notas de Conhecimento\n\n"
+            for n in notes:
+                content += f"### {n['topic']} ({n['category']})\n{n['content']}\n\n"
+    else:
+        content = json.dumps({
+            "topic": topic, "trace_chunks": [dict(c) for c in chunks],
+            "notes": [dict(n) for n in notes],
+        }, indent=2, default=str)
+
+    filename.write_text(content, encoding="utf-8")
+
+    return {
+        "exported_to": str(filename),
+        "chunks_found": len(chunks),
+        "notes_found":  len(notes),
+        "preview":      content[:800],
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BLOCO B — FERRAMENTAS SEMÂNTICAS (rgrz/peoplesoft-mcp)
+# ════════════════════════════════════════════════════════════════════════════
+from tools.introspection import register_tools as _reg_introspection
+from tools.hr            import register_tools as _reg_hr
+from tools.payroll       import register_tools as _reg_payroll
+from tools.performance   import register_tools as _reg_performance
+from tools.benefits      import register_tools as _reg_benefits
+from tools.peopletools   import register_tools as _reg_peopletools
+
+_reg_introspection(mcp)
+_reg_hr(mcp)
+_reg_payroll(mcp)
+_reg_performance(mcp)
+_reg_benefits(mcp)
+_reg_peopletools(mcp)
+
+# ════════════════════════════════════════════════════════════════════════════
+# BLOCO C — FERRAMENTAS T&L ESPECÍFICAS (Itaú / Jornada Mista / SEMESTRAL)
+# ════════════════════════════════════════════════════════════════════════════
+from tools.tl import register_tools as _reg_tl
+_reg_tl(mcp)
+
+# ════════════════════════════════════════════════════════════════════════════
+# BLOCO D — SENTRY: MONITORAMENTO DE PRODUÇÃO + BASE DE SOPs (CAG)
+#   Inspirado em peoplesoft_sentry (AIOps Diagnostic Engine)
+#   • ps_get_ib_errors        → Erros no Integration Broker (PS_MSG_INST)
+#   • ps_get_process_errors   → Falhas no Process Monitor (PSPRCSRQST)
+#   • ps_get_system_summary   → Resumo de saúde do ambiente
+#   • ps_health_check         → Diagnóstico completo + match automático de SOP
+#   • ps_lookup_sop           → Consulta à base de SOPs por texto de erro
+# ════════════════════════════════════════════════════════════════════════════
+from tools.sentry import register_tools as _reg_sentry
+_reg_sentry(mcp)
+
+# Resource: biblioteca de SOPs como contexto CAG (Cache-Augmented Generation)
+@mcp.resource("peoplesoft://sop-library")
+def get_sop_library() -> str:
+    """Base de conhecimento de SOPs PeopleSoft para suporte a produção (CAG)."""
+    from tools.sentry import get_all_sops_as_text
+    return get_all_sops_as_text()
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    print("=" * 60)
+    print("  mcp-peoplesoft — PeopleSoft MCP Server (Itaú Unibanco)")
+    print("=" * 60)
+    print("  Blocos carregados:")
+    print("  [A] Análise: trace_workflow, get_table_metadata,")
+    print("      get_peoplecode, search_references, run_safe_query,")
+    print("      suggest_change, get_workflow_def, get_ib_service,")
+    print("      export_knowledge")
+    print("  [B] Semântico: describe_table, list_tables,")
+    print("      get_employee, search_employees, get_job_history,")
+    print("      get_org_chart, get_payroll_results, + benefits,")
+    print("      performance, 20+ PeopleTools tools")
+    print("  [C] T&L: tl_list_group_rules, tl_get_rule_step_sql,")
+    print("      tl_find_overtime_rules, tl_get_employee_ipt,")
+    print("      tl_detect_mixed_shift_bug, tl_generate_fix_proposal,")
+    print("      tl_group_coverage_report")
+    print("  [D] Sentry: ps_get_ib_errors, ps_get_process_errors,")
+    print("      ps_get_system_summary, ps_health_check, ps_lookup_sop")
+    print("  Resources: schema-guide, concepts, query-examples,")
+    print("      peopletools-guide, sop-library (CAG)")
+    print("=" * 60)
+    mcp.run()

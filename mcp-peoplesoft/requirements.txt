@@ -1,7 +1,29 @@
-mcp>=1.0.0
-oracledb>=2.0.0
+# mcp-peoplesoft — dependências
+# Python 3.11+
+# Instalar: pip install -r requirements.txt
+
+# MCP Framework
+fastmcp>=2.4.0
+mcp[cli]>=1.9.0
+
+# Oracle DB (thin mode — sem Oracle Client)
+oracledb>=3.1.1
+
+# Variáveis de ambiente
+python-dotenv>=1.0.0
+
+# Comunicação assíncrona
+aiohttp>=3.11.0
+
+# Análise semântica de trace (embedding — lazy load)
 sentence-transformers>=2.7.0
 numpy>=1.26.0
+
+# Grafo de dependências
 networkx>=3.3
+
+# ML auxiliar
 scikit-learn>=1.4.0
+
+# SOAP / Integration Broker (opcional)
 zeep>=4.2.1
