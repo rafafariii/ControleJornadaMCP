@@ -1,0 +1,40 @@
+# ── Configuração sensível do Claude Desktop (NÃO commitar)
+claude_desktop_config.json
+
+# ── Variáveis de ambiente / credenciais
+.env
+.env.*
+*.env
+
+# ── Banco de conhecimento local (gerado em runtime)
+knowledge/knowledge.db
+knowledge/vectors/
+knowledge/traces/
+knowledge/exports/
+
+# ── Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ── IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs
+*.log
+*.trc
+*.tracesql

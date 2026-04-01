@@ -1,0 +1,7 @@
+mcp>=1.0.0
+oracledb>=2.0.0
+sentence-transformers>=2.7.0
+numpy>=1.26.0
+networkx>=3.3
+scikit-learn>=1.4.0
+zeep>=4.2.1
